@@ -381,6 +381,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 			cmd = cmd1
 		}
 	}
+	// DPrintf("%d servers think log %d is committed", count, index)
 	return count, cmd
 }
 
