@@ -193,19 +193,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// Heartbeat message.
 			reply.Success = true
 			rf.commitIndex = args.LeaderCommit
-		} else if args.PrevLogIndex <= 0 || rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm {
+		} else if args.PrevLogIndex <= len(rf.log) && (args.PrevLogIndex <= 0 || rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm) {
 			rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
 			rf.commitIndex = args.LeaderCommit
 			reply.Success = true
 		} else {
+			DPrintf("AppendEntries to %d failed, args.PrevLogIndex is %d, args.PrevLogTerm is %d, len(rf.log) is %d, len(args.Entries) is %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, len(rf.log), len(args.Entries))
 			reply.Success = false
 		}
-		reply.Term = rf.currentTerm
 
 		notify = true
 	} else {
 		DPrintf("instance %d (currentTerm %d) reject AppendEntries: Term %d, LeaderID %d", rf.me, rf.currentTerm, args.Term, args.LeaderID)
+		reply.Success = false
 	}
+
+	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 
 	if notify {
@@ -226,6 +229,10 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int
 	CandidateID int
+	// Index of candidate's last log entry.
+	LastLogIndex int
+	// Term of candidate's last log entry.
+	LastLogTerm int
 }
 
 //
@@ -246,7 +253,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	var notify bool
 
 	rf.mu.Lock()
-	if args.Term > rf.currentTerm || args.Term == rf.currentTerm && rf.votedFor == args.CandidateID {
+	lastLogIndex, lastLogTerm := len(rf.log), 0
+	if lastLogIndex >= 1 {
+		lastLogTerm = rf.log[lastLogIndex-1].Term
+	}
+
+	if args.LastLogTerm < lastLogTerm || args.LastLogTerm == lastLogTerm && lastLogIndex > args.LastLogIndex {
+		// The log of candidate is not the most update.
+		DPrintf("instance %d (currentTerm %d) reject RequestVote from %d, because the log is not most up to date", rf.me, rf.currentTerm, args.CandidateID)
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+	} else if args.Term > rf.currentTerm || args.Term == rf.currentTerm && rf.votedFor == args.CandidateID {
 		// If it is newer term or the RequestVote we have voted.
 		if rf.role != Follower {
 			// Only output log if necessary.
@@ -330,10 +347,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
+	DPrintf("Leader %d receive new command %v", rf.me, command)
+
 	rf.log = append(rf.log, LogEntry{
 		Term:    rf.currentTerm,
 		Command: command,
 	})
+	rf.matchIndex[rf.me] = len(rf.log)
 
 	return len(rf.log), rf.currentTerm, true
 }
@@ -381,9 +401,14 @@ func (rf *Raft) runAsCandidate() {
 	replyCh := make(chan *RequestVoteReply, len(rf.peers)-1)
 
 	args := &RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateID: rf.me,
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+		LastLogIndex: len(rf.log),
 	}
+	if args.LastLogIndex > 0 {
+		args.LastLogTerm = rf.log[args.LastLogIndex-1].Term
+	}
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			// Already voted for self.
@@ -514,14 +539,17 @@ func (rf *Raft) runAsLeader() {
 						// Apply failed.
 						if reply.Term > rf.currentTerm {
 							DPrintf("Send AppendEntries failed, follower %d has bigger term", index)
-							// TODO: We're not leader anymore.
+							rf.role = Follower
+							rf.currentTerm = reply.Term
+							rf.done <- struct{}{}
+							return
 						} else {
 							DPrintf("Send AppendEntries failed, follower %d has different log", index)
 							// Don't match PrevLogIndex and PrevLogTerm.
 							args.PrevLogIndex = args.PrevLogIndex - 1
+							args.Entries = append([]LogEntry{rf.log[args.PrevLogIndex]}, args.Entries...)
 							if args.PrevLogIndex > 0 {
 								args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
-								args.Entries = append([]LogEntry{rf.log[args.PrevLogIndex-1]}, entries...)
 							}
 						}
 					} else {
@@ -544,7 +572,7 @@ func (rf *Raft) runAsLeader() {
 			sort.Ints(s)
 
 			if s[len(s)/2] > rf.commitIndex {
-				DPrintf("CommandIndex of leader has been updated to %d", s[len(s)/2])
+				DPrintf("CommandIndex of leader %d has been updated to %d", rf.me, s[len(s)/2])
 				rf.commitIndex = s[len(s)/2]
 			}
 		}
