@@ -17,6 +17,7 @@ package raft
 //   in the same server.
 //
 
+import "context"
 import "math/rand"
 import "sort"
 import "sync"
@@ -97,7 +98,13 @@ type Raft struct {
 	// on server.
 	matchIndex []int
 
-	done chan struct{}
+	// The timestamp of latest received valid RPC(AppendEntries from current leader or granting vote
+	// to candidate).
+	validRpcTimestamp time.Time
+
+	// The rollback is used to indicate that a valid RPC has received, so the role of instance should
+	// rollback to Follower.
+	rollback chan struct{}
 
 	applyCh chan ApplyMsg
 }
@@ -176,43 +183,40 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	var notify bool
-
 	rf.mu.Lock()
-	if args.Term >= rf.currentTerm {
-		if rf.role != Follower {
-			DPrintf("Valid AppendEntries, instance %d fallback to follower\n", rf.me)
-		}
+	defer rf.mu.Unlock()
 
+	if args.Term < rf.currentTerm || args.PrevLogIndex > len(rf.log) || (args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+		// 1. The AppendEntries is out of date.
+		// 2. The PrevLogIndex is longer than Log.
+		// 3. Log doesn't contain an entry at PrevLogIndex
+		// whose term match PrevLogTerm.
+		reply.Success = false
+		reply.Term = rf.currentTerm
+	} else {
+		reply.Success = true
+		reply.Term = rf.currentTerm
+
+		if rf.role == Follower {
+			rf.validRpcTimestamp = time.Now()
+		} else {
+			close(rf.rollback)
+			rf.role = Follower
+		}
 		rf.currentTerm = args.Term
-		rf.leader = args.LeaderID
-		// Change back to follower anyway.
-		rf.role = Follower
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = args.LeaderCommit
+		}
 
 		if len(args.Entries) == 0 {
-			// Heartbeat message.
-			reply.Success = true
-			rf.commitIndex = args.LeaderCommit
-		} else if args.PrevLogIndex <= len(rf.log) && (args.PrevLogIndex <= 0 || rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm) {
-			rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
-			rf.commitIndex = args.LeaderCommit
-			reply.Success = true
+			// Heartbeat.
+			if args.LeaderCommit > len(rf.log) {
+				// commitIndex = min(leaderCommit, index of last new entry).
+				rf.commitIndex = len(rf.log)
+			}
 		} else {
-			DPrintf("AppendEntries to %d failed, args.PrevLogIndex is %d, args.PrevLogTerm is %d, len(rf.log) is %d, len(args.Entries) is %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, len(rf.log), len(args.Entries))
-			reply.Success = false
+			rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
 		}
-
-		notify = true
-	} else {
-		DPrintf("instance %d (currentTerm %d) reject AppendEntries: Term %d, LeaderID %d", rf.me, rf.currentTerm, args.Term, args.LeaderID)
-		reply.Success = false
-	}
-
-	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
-
-	if notify {
-		rf.done <- struct{}{}
 	}
 }
 
@@ -250,42 +254,35 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	var notify bool
-
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	lastLogIndex, lastLogTerm := len(rf.log), 0
-	if lastLogIndex >= 1 {
+	if lastLogIndex > 0 {
 		lastLogTerm = rf.log[lastLogIndex-1].Term
 	}
 
-	if args.LastLogTerm < lastLogTerm || args.LastLogTerm == lastLogTerm && lastLogIndex > args.LastLogIndex {
-		// The log of candidate is not the most update.
-		DPrintf("instance %d (currentTerm %d) reject RequestVote from %d, because the log is not most up to date", rf.me, rf.currentTerm, args.CandidateID)
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && args.CandidateID != rf.votedFor) || args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && lastLogIndex > args.LastLogIndex) {
+		// 1. The Term of RequestVote is out of date.
+		// 2. The instance vote for other peer in this term.
+		// 3. The log of Candidate is not the most update.
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-	} else if args.Term > rf.currentTerm || args.Term == rf.currentTerm && rf.votedFor == args.CandidateID {
-		// If it is newer term or the RequestVote we have voted.
-		if rf.role != Follower {
-			// Only output log if necessary.
-			DPrintf("Valid RequestVote, instance %d fallback to follower\n", rf.me)
-		}
+	} else {
+		DPrintf("instance %d vote for %d, lastLogIndex is %d, args.LastLogIndex is %d, lastLogTerm is %d, args.LastLogTerm is %d", rf.me, args.CandidateID, lastLogIndex, args.LastLogIndex, lastLogTerm, args.LastLogTerm)
 		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
 
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.Term
-		rf.role = Follower
 
-		notify = true
-	} else {
-		DPrintf("instance %d (currentTerm %d) reject RequestVote: Term %d, CandidateID %d", rf.me, rf.currentTerm, args.Term, args.CandidateID)
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-	}
-	rf.mu.Unlock()
-
-	if notify {
-		// If in Candidate or Leader state, notify to fallback to Follower.
-		rf.done <- struct{}{}
+		if rf.role == Follower {
+			rf.validRpcTimestamp = time.Now()
+		} else {
+			// Notify the change of the role of instance.
+			close(rf.rollback)
+			rf.role = Follower
+		}
 	}
 
 	return
@@ -347,7 +344,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	DPrintf("Leader %d receive new command %v", rf.me, command)
+	// DPrintf("Leader %d receive new command %v", rf.me, command)
 
 	rf.log = append(rf.log, LogEntry{
 		Term:    rf.currentTerm,
@@ -378,193 +375,226 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) runAsFollower() {
-	select {
-	case <-time.After(time.Duration(150+rand.Intn(150)) * time.Millisecond):
-		rf.role = Candidate
-		rf.votedFor = rf.me
+func (rf *Raft) runAsFollower(ts time.Time) {
+	// Wait for election timeout.
+	time.Sleep(time.Duration(150+rand.Intn(150)) * time.Millisecond)
 
-		rf.mu.Lock()
-		rf.currentTerm = rf.currentTerm + 1
-		rf.mu.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-		DPrintf("instance %d follower -> candidate, currentTerm %d\n", rf.me, rf.currentTerm)
-
-	case <-rf.done:
-		// Receive valid RequestVote or AppendEntries.
+	if !rf.validRpcTimestamp.Equal(ts) {
+		// Received AppendEntries RPC from current leader or granting
+		// vote to candidate during the elapsed time.
+		return
 	}
+
+	// Otherwise convert to candidate.
+	rf.role = Candidate
+	rf.currentTerm = rf.currentTerm + 1
+	rf.votedFor = rf.me
+	rf.rollback = make(chan struct{})
+	DPrintf("instance %d follower -> candidate, currentTerm %d", rf.me, rf.currentTerm)
+
+	return
 }
 
-func (rf *Raft) runAsCandidate() {
-	var stop bool
+func (rf *Raft) runAsCandidate(args *RequestVoteArgs) {
+	var mu sync.Mutex
 
-	replyCh := make(chan *RequestVoteReply, len(rf.peers)-1)
-
-	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateID:  rf.me,
-		LastLogIndex: len(rf.log),
-	}
-	if args.LastLogIndex > 0 {
-		args.LastLogTerm = rf.log[args.LastLogIndex-1].Term
-	}
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			// Already voted for self.
-			continue
-		}
-
-		go func(i int) {
-			// Keep send VoteRequest until get a reply or go to next term.
-			reply := &RequestVoteReply{}
-			for !stop {
-				if ok := rf.sendRequestVote(i, args, reply); ok {
-					break
-				}
-			}
-			replyCh <- reply
-		}(i)
-	}
-
-	timeoutCh := make(chan struct{})
-	go func() {
-		time.Sleep(time.Duration(150+rand.Intn(150)) * time.Millisecond)
-		close(timeoutCh)
-	}()
-
-	// Vote for self.
 	cnt := 1
-	for {
-		select {
-		case <-timeoutCh:
-			rf.mu.Lock()
-			// It is possible we reply to the valid RequestVote and AppendEntries, but run this
-			// branch first, so we only increment currentTerm, if we still in Candidate state.
-			if rf.role == Candidate {
-				// Election timeout, another term.
-				rf.currentTerm = rf.currentTerm + 1
-				DPrintf("instance %d is candidate, timeout update term to %d", rf.me, rf.currentTerm)
-			}
-			rf.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(i int) {
+				// Keep sending VoteRequest until get a reply or this term is no longer valid.
+				for {
+					reply := &RequestVoteReply{}
+					if ok := rf.sendRequestVote(i, args, reply); ok {
+						if reply.VoteGranted {
+							mu.Lock()
+							cnt = cnt + 1
+							if cnt == (len(rf.peers)+1)/2 {
+								// This instance could become Leader.
+								cancel()
+								rf.mu.Lock()
+								if rf.role == Candidate && rf.currentTerm == args.Term {
+									// If this instance is still Candidate and term has never changed.
+									rf.role = Leader
+									// Initialize the volatile state of Leader.
+									for i := 0; i < len(rf.peers); i++ {
+										if i != rf.me {
+											rf.nextIndex[i] = len(rf.log) + 1
+											rf.matchIndex[i] = 0
+										} else {
+											// Initialize the matchIndex of leader to len(rf.log).
+											rf.matchIndex[i] = len(rf.log)
+										}
+									}
+								}
+								DPrintf("instance %d candidate -> leader, currentTerm %d", rf.me, rf.currentTerm)
+								rf.mu.Unlock()
+							}
+							mu.Unlock()
+						} else if reply.Term > args.Term {
+							// The term of this instance may be out of date.
+							// Canel the request of this vote anyway.
+							cancel()
+							rf.mu.Lock()
+							if rf.currentTerm < reply.Term {
+								// Convert back to Follower.
+								DPrintf("instance %d candidate -> follower, received RequestVoteReply, currentTerm: %d, reply.Term: %d", rf.me, rf.currentTerm, reply.Term)
+								rf.role = Follower
+								rf.currentTerm = reply.Term
+								// This instance will never vote for others in this term.
+								rf.votedFor = rf.me
+							}
+							rf.mu.Unlock()
+						}
 
-			stop = true
-			return
-
-		case reply := <-replyCh:
-			rf.mu.Lock()
-			if reply.VoteGranted {
-				cnt++
-				if cnt >= (len(rf.peers)+1)/2 {
-					// Be elected as leader.
-					DPrintf("instance %d (currentTerm %d) candidate -> leader\n", rf.me, rf.currentTerm)
-
-					// Only become Leader if now still is Candidate.
-					if rf.role == Candidate {
-						rf.role = Leader
+						return
 					}
-					rf.mu.Unlock()
 
-					stop = true
-					return
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
 				}
-			} else if reply.Term > rf.currentTerm {
-				// Someone has higher term, fallback to Follower.
-				DPrintf("instance %d is candidate, but receive reply.Term = %d > currentTerm = %d, back to follower", rf.me, reply.Term, rf.currentTerm)
-				rf.role = Follower
-				rf.mu.Unlock()
-
-				stop = true
-				return
-			}
-			rf.mu.Unlock()
-
-		case <-rf.done:
-			// Receive valid RequestVote or AppendEntries, fallback to Follower.
-			stop = true
-			return
+			}(i)
 		}
+	}
+
+	select {
+	case <-time.After(time.Duration(150+rand.Intn(150)) * time.Millisecond):
+		rf.mu.Lock()
+		if rf.role == Candidate && rf.currentTerm == args.Term {
+			// Election timeout, maybe because of split vote, start new election.
+			rf.currentTerm = rf.currentTerm + 1
+			DPrintf("instance %d is candidate update to term %d because of timeout", rf.me, rf.currentTerm)
+			cancel()
+		}
+		rf.mu.Unlock()
+	case <-ctx.Done():
+
+	case <-rf.rollback:
+		cancel()
 	}
 }
 
 func (rf *Raft) runAsLeader() {
-	// Initialize leader specific fields.
-	rf.mu.Lock()
-	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.log) + 1
-		rf.matchIndex[i] = 0
-	}
-	rf.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for {
+			// Heartbeat goroutine.
+			rf.mu.Lock()
+			if rf.role != Leader {
+				rf.mu.Unlock()
+				return
+			}
+			args := []*AppendEntriesArgs{}
+			for i := 0; i < len(rf.peers); i++ {
+				commit := rf.commitIndex
+				if commit > rf.matchIndex[i] {
+					// Avoid to commit log that has not been synced with Leader already.
+					commit = rf.matchIndex[i]
+				}
+				args = append(args, &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderID:     rf.me,
+					LeaderCommit: commit,
+				})
+			}
+			rf.mu.Unlock()
+
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					go func(i int) {
+						rf.sendAppendEntries(i, args[i], &AppendEntriesReply{})
+					}(i)
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 
 	// Keep appending entries if necessary.
 	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-
-		go func(index int) {
-			for rf.role == Leader {
-				if len(rf.log) == 0 || (rf.matchIndex[index] != 0 && rf.nextIndex[index] == len(rf.log)+1) {
-					// New new log entry.
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-
-				n, t := len(rf.log), -1
-				if n-1 > 0 {
-					t = rf.log[n-2].Term
-				}
-
-				entries := []LogEntry{rf.log[n-1]}
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderID:     rf.me,
-					LeaderCommit: rf.commitIndex,
-					PrevLogIndex: n - 1,
-					PrevLogTerm:  t,
-					Entries:      entries,
-				}
-
-				reply := &AppendEntriesReply{}
-
-				// Otherwise keep append.
-				ok := false
-				for rf.role == Leader && (!ok || !reply.Success) {
-					ok = rf.sendAppendEntries(index, args, reply)
-					if !ok {
-						DPrintf("Send AppendEntries meet network failure")
-						// Network failure.
+		if i != rf.me {
+			go func(i int) {
+				for {
+					rf.mu.Lock()
+					if rf.role != Leader {
+						rf.mu.Unlock()
+						return
+					}
+					// TODO: maybe change to condition variable.
+					if len(rf.log) == 0 || (rf.matchIndex[i] != 0 && rf.nextIndex[i] == len(rf.log)+1) {
+						// 1. Instance don't have log, so don't need to append.
+						// 2. Log has been appended.
+						rf.mu.Unlock()
+						time.Sleep(10 * time.Millisecond)
 						continue
-					} else if !reply.Success {
-						// Apply failed.
-						if reply.Term > rf.currentTerm {
-							DPrintf("Send AppendEntries failed, follower %d has bigger term", index)
-							rf.role = Follower
-							rf.currentTerm = reply.Term
-							rf.done <- struct{}{}
-							return
+					}
+
+					prevLogIndex, prevLogTerm := rf.nextIndex[i]-1, 0
+					if prevLogIndex > 0 {
+						prevLogTerm = rf.log[prevLogIndex-1].Term
+					}
+					entries := rf.log[prevLogIndex:]
+					args := &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderID:     rf.me,
+						LeaderCommit: rf.commitIndex,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      entries,
+					}
+					rf.mu.Unlock()
+
+					reply := &AppendEntriesReply{}
+					if ok := rf.sendAppendEntries(i, args, reply); ok {
+						rf.mu.Lock()
+						if reply.Success {
+							rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
+							rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+							DPrintf("instance %d AppendEntries to %d succeeded, matchIndex[i] is %d", rf.me, i, rf.matchIndex[i])
 						} else {
-							DPrintf("Send AppendEntries failed, follower %d has different log", index)
-							// Don't match PrevLogIndex and PrevLogTerm.
-							args.PrevLogIndex = args.PrevLogIndex - 1
-							args.Entries = append([]LogEntry{rf.log[args.PrevLogIndex]}, args.Entries...)
-							if args.PrevLogIndex > 0 {
-								args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+							if reply.Term > rf.currentTerm {
+								// Convert back to Follower.
+								// DPrintf("instance %d leader -> follower, received RequestVoteReply, currentTerm: %d, reply.Term: %d", rf.me, rf.currentTerm, reply.Term)
+								rf.currentTerm = reply.Term
+								rf.role = Follower
+								// This instance will never vote for others in this term.
+								rf.votedFor = rf.me
+								cancel()
+							} else {
+								// DPrintf("instance %d AppendEntries to %d failed because of inconsistent log", rf.me, i)
+								rf.nextIndex[i] = rf.nextIndex[i] - 1
 							}
 						}
-					} else {
-						// Apply succeeded.
-						rf.nextIndex[index] = n + 1
-						rf.matchIndex[index] = n
+						rf.mu.Unlock()
 					}
+
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
 				}
-			}
-		}(i)
+			}(i)
+		}
 	}
 
 	go func() {
-		for rf.role == Leader {
+		for {
 			time.Sleep(10 * time.Millisecond)
+			rf.mu.Lock()
+			if rf.role != Leader {
+				rf.mu.Unlock()
+				return
+			}
+
 			var s []int
 			for i := 0; i < len(rf.matchIndex); i++ {
 				s = append(s, rf.matchIndex[i])
@@ -575,31 +605,15 @@ func (rf *Raft) runAsLeader() {
 				DPrintf("CommandIndex of leader %d has been updated to %d", rf.me, s[len(s)/2])
 				rf.commitIndex = s[len(s)/2]
 			}
+
+			rf.mu.Unlock()
 		}
 	}()
 
-	for {
-		select {
-		case <-time.After(100 * time.Millisecond):
-			args := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderID:     rf.me,
-				LeaderCommit: rf.commitIndex,
-			}
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				}
-				go func(i int) {
-					rf.sendAppendEntries(i, args, &AppendEntriesReply{})
-				}(i)
-			}
-
-		case <-rf.done:
-			// Receive valid RequestVote or AppendEntries, fallback to Follower.
-			DPrintf("instance %d leader -> follower\n", rf.me)
-			return
-		}
+	select {
+	case <-ctx.Done():
+	case <-rf.rollback:
+		cancel()
 	}
 }
 
@@ -621,20 +635,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.role = Follower
-	rf.done = make(chan struct{})
+	rf.votedFor = -1
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.validRpcTimestamp = time.Now()
 	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	go func() {
 		for {
-			switch rf.role {
+			rf.mu.Lock()
+			role := rf.role
+
+			switch role {
 			case Follower:
-				rf.runAsFollower()
+				ts := rf.validRpcTimestamp
+				rf.mu.Unlock()
+				rf.runAsFollower(ts)
 			case Candidate:
-				rf.runAsCandidate()
+				lastLogIndex := len(rf.log)
+				args := &RequestVoteArgs{
+					Term:         rf.currentTerm,
+					CandidateID:  rf.me,
+					LastLogIndex: lastLogIndex,
+				}
+				if lastLogIndex > 0 {
+					args.LastLogTerm = rf.log[lastLogIndex-1].Term
+				}
+				rf.mu.Unlock()
+				rf.runAsCandidate(args)
 			case Leader:
+				rf.mu.Unlock()
 				rf.runAsLeader()
 			}
 		}
@@ -656,6 +687,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					}
 				}
 				record = current
+			}
+		}
+	}()
+
+	// Wait for commitIndex to be updated.
+	go func() {
+		record := 0
+
+		for {
+			time.Sleep(10 * time.Millisecond)
+
+			var entries []LogEntry
+			rf.mu.Lock()
+			if rf.commitIndex > record {
+				entries = rf.log[record:rf.commitIndex]
+			}
+			rf.mu.Unlock()
+
+			for i := 0; i < len(entries); i++ {
+				record = record + 1
+				applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      entries[i].Command,
+					CommandIndex: record,
+				}
 			}
 		}
 	}()

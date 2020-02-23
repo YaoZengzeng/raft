@@ -382,11 +382,14 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
+	DPrintf("group: %d, %d", (leader1+0)%servers, (leader1+1)%servers)
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
+
+	DPrintf("submit lots of commands that won't commit")
 
 	time.Sleep(RaftElectionTimeout / 2)
 
@@ -397,11 +400,14 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
+	DPrintf("group: %d, %d, %d", (leader1+2)%servers, (leader1+3)%servers, (leader1+4)%servers)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
+
+	DPrintf("lots of successful commands to new group")
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
@@ -410,11 +416,14 @@ func TestBackup2B(t *testing.T) {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
+	DPrintf("disconnect %d", other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
+
+	DPrintf("second time, lots more commands that won't commit")
 
 	time.Sleep(RaftElectionTimeout / 2)
 
@@ -425,17 +434,22 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
+	DPrintf("group: %d, %d, %d", (leader1+0)%servers, (leader1+1)%servers, other)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
+	DPrintf("second time, lots of successful commands to new group")
+
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
 	cfg.one(rand.Int(), servers, true)
+
+	DPrintf("finally to everyone")
 
 	cfg.end()
 }
