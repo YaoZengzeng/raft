@@ -3,13 +3,14 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
-	"log"
 	"../raft"
+	"log"
+	"reflect"
 	"sync"
 	"sync/atomic"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +19,23 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op    string // "Get", "Put" or "Append"
+	Key   string
+	Value string
+}
+
+type Result struct {
+	Err   Err
+	Value string
+}
+
+type Handler struct {
+	command Op
+	ch      chan *Result
 }
 
 type KVServer struct {
@@ -35,15 +48,63 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	storage map[string]string // key/value database.
+	notify  map[int]*Handler
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	command := Op{
+		Op:  "Get",
+		Key: args.Key,
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	handler := &Handler{
+		command: command,
+		ch:      make(chan *Result),
+	}
+	kv.mu.Lock()
+	kv.notify[index] = handler
+	kv.mu.Unlock()
+
+	result := <-handler.ch
+	reply.Err = result.Err
+	reply.Value = result.Value
+
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	command := Op{
+		Op:    args.Op,
+		Key:   args.Key,
+		Value: args.Value,
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	handler := &Handler{
+		command: command,
+		ch:      make(chan *Result),
+	}
+	kv.mu.Lock()
+	kv.notify[index] = handler
+	kv.mu.Unlock()
+
+	result := <-handler.ch
+	reply.Err = result.Err
+
+	return
 }
 
 //
@@ -91,11 +152,59 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.storage = make(map[string]string)
+	kv.notify = make(map[int]*Handler)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go func() {
+		for {
+			msg := <-kv.applyCh
+			op, ok := msg.Command.(Op)
+			if !ok {
+				panic("assert command failed")
+			}
+
+			var value string
+			switch op.Op {
+			case "Get":
+				value = kv.storage[op.Key]
+
+			case "Put":
+				kv.storage[op.Key] = op.Value
+				value = op.Value
+
+			case "Append":
+				value = kv.storage[op.Key] + op.Value
+				kv.storage[op.Key] = value
+
+			default:
+				panic("invalid command op")
+
+			}
+
+			handler, ok := kv.notify[msg.CommandIndex]
+			if !ok {
+				continue
+			}
+
+			var result *Result
+			if !reflect.DeepEqual(handler.command, op) {
+				DPrintf("command %v not committed", op)
+				result = &Result{
+					Err: "command not committed",
+				}
+			} else {
+				result = &Result{
+					Value: value,
+				}
+			}
+
+			handler.ch <- result
+		}
+	}()
 
 	return kv
 }
