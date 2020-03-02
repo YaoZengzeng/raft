@@ -3,10 +3,16 @@ package kvraft
 import "../labrpc"
 import "crypto/rand"
 import "math/big"
+import "sync"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	id        int64
+	requestID int64
+
+	mu     sync.Mutex
+	leader int
 }
 
 func nrand() int64 {
@@ -19,7 +25,9 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	DPrintf("number of server is %v", len(servers))
 	// You'll have to add code here.
+	ck.id = nrand()
 	return ck
 }
 
@@ -38,15 +46,32 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := &GetArgs{
-		Key: key,
+		Key:       key,
+		ClerkID:   ck.id,
+		RequestID: ck.requestID,
 	}
+	ck.requestID = ck.requestID + 1
 
-	for i := 0; ; i++ {
+	ck.mu.Lock()
+	i := ck.leader
+	ck.mu.Unlock()
+	for {
 		reply := &GetReply{}
-		ck.servers[i%len(ck.servers)].Call("KVServer.Get", args, reply)
-		if reply.Err != "" {
+		ok := ck.servers[i].Call("KVServer.Get", args, reply)
+		if !ok {
+			DPrintf("clerk %d timeout for server %d", ck.id, i)
+			// Keep request same instance.
+			continue
+		} else if reply.Err != "" {
+			// DPrintf("clerk %d Get reply error is %v", ck.id, reply.Err)
+			i = (i + 1) % len(ck.servers)
 			continue
 		}
+
+		// Remember leader.
+		ck.mu.Lock()
+		ck.leader = i
+		ck.mu.Unlock()
 		return reply.Value
 	}
 
@@ -66,17 +91,34 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := &PutAppendArgs{
-		Op:    op,
-		Key:   key,
-		Value: value,
+		Op:        op,
+		Key:       key,
+		Value:     value,
+		ClerkID:   ck.id,
+		RequestID: ck.requestID,
 	}
+	ck.requestID = ck.requestID + 1
 
-	for i := 0; ; i++ {
+	ck.mu.Lock()
+	i := ck.leader
+	ck.mu.Unlock()
+	for {
 		reply := &PutAppendReply{}
-		ck.servers[i%len(ck.servers)].Call("KVServer.PutAppend", args, reply)
-		if reply.Err != "" {
+		ok := ck.servers[i].Call("KVServer.PutAppend", args, reply)
+		if !ok {
+			DPrintf("clerk %d timeout for server %d", ck.id, i)
+			// Keep request same instance.
+			continue
+		} else if reply.Err != "" {
+			// DPrintf("clerk %d %v reply error is %v", ck.id, op, reply.Err)
+			i = (i + 1) % len(ck.servers)
 			continue
 		}
+
+		// Remember leader.
+		ck.mu.Lock()
+		ck.leader = i
+		ck.mu.Unlock()
 		return
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 1
@@ -38,6 +39,15 @@ type Handler struct {
 	ch      chan *Result
 }
 
+// Record is used to record the latest result corresponding clerk should get.
+type Record struct {
+	requestID int64
+	finished  bool
+
+	value string
+	err   Err
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -50,9 +60,33 @@ type KVServer struct {
 	// Your definitions here.
 	storage map[string]string // key/value database.
 	notify  map[int]*Handler
+
+	records map[int64]*Record
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	kv.mu.Lock()
+	record := kv.records[args.ClerkID]
+	kv.mu.Unlock()
+
+	if record != nil && record.requestID == args.RequestID {
+		if record.requestID == args.RequestID {
+			for {
+				// TODO: make it more elegant.
+				if record.finished {
+					reply.Err = record.err
+					reply.Value = record.value
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		} else if record.requestID > args.RequestID {
+			// This request is delayed too much, rare case.
+			// Return directly for the reply will make no affect.
+			return
+		}
+	}
+
 	command := Op{
 		Op:  "Get",
 		Key: args.Key,
@@ -64,11 +98,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	kv.mu.Lock()
+	DPrintf("set record for clerk %d request %d", args.ClerkID, args.RequestID)
+	kv.records[args.ClerkID] = &Record{
+		requestID: args.RequestID,
+	}
+
 	handler := &Handler{
 		command: command,
 		ch:      make(chan *Result),
 	}
-	kv.mu.Lock()
 	kv.notify[index] = handler
 	kv.mu.Unlock()
 
@@ -76,11 +115,42 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = result.Err
 	reply.Value = result.Value
 
+	kv.mu.Lock()
+	// DPrintf("request %d of clerk %d is finished", args.RequestID, args.ClerkID)
+	kv.records[args.ClerkID].finished = true
+	kv.records[args.ClerkID].value = result.Value
+	kv.records[args.ClerkID].err = result.Err
+	kv.mu.Unlock()
+
 	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	record := kv.records[args.ClerkID]
+	kv.mu.Unlock()
+
+	if record != nil {
+		if record.requestID == args.RequestID {
+			DPrintf("record already exist for clerk %d request %d", args.ClerkID, args.RequestID)
+			for {
+				// TODO: make it more elegant.
+				if record.finished {
+					reply.Err = record.err
+					return
+				}
+				// DPrintf("clerk %d PutAppend is not finished", args.ClerkID)
+				time.Sleep(10 * time.Millisecond)
+			}
+		} else if record.requestID > args.RequestID {
+			DPrintf("request %d of clerk %d smaller than record", args.RequestID, args.ClerkID)
+			// This request is delayed too much, rare case.
+			// Return directly for the reply will make no affect.
+			return
+		}
+	}
+
 	command := Op{
 		Op:    args.Op,
 		Key:   args.Key,
@@ -92,17 +162,29 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	DPrintf("leader is %v", kv.me)
+
+	kv.mu.Lock()
+	DPrintf("set record for clerk %d request %d", args.ClerkID, args.RequestID)
+	kv.records[args.ClerkID] = &Record{
+		requestID: args.RequestID,
+	}
 
 	handler := &Handler{
 		command: command,
 		ch:      make(chan *Result),
 	}
-	kv.mu.Lock()
 	kv.notify[index] = handler
 	kv.mu.Unlock()
 
 	result := <-handler.ch
 	reply.Err = result.Err
+
+	kv.mu.Lock()
+	// DPrintf("request %d of clerk %d is finished", args.RequestID, args.ClerkID)
+	kv.records[args.ClerkID].finished = true
+	kv.records[args.ClerkID].err = result.Err
+	kv.mu.Unlock()
 
 	return
 }
@@ -154,6 +236,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.storage = make(map[string]string)
 	kv.notify = make(map[int]*Handler)
+	kv.records = make(map[int64]*Record)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -162,6 +245,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go func() {
 		for {
 			msg := <-kv.applyCh
+			DPrintf("Get a message %v from applyCh", msg)
 			op, ok := msg.Command.(Op)
 			if !ok {
 				panic("assert command failed")
@@ -185,7 +269,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 			}
 
+			kv.mu.Lock()
 			handler, ok := kv.notify[msg.CommandIndex]
+			kv.mu.Unlock()
 			if !ok {
 				continue
 			}
