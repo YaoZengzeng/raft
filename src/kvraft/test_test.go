@@ -216,6 +216,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					}
 				}
 			}
+			DPrintf("client quit!\n\n")
 		})
 
 		if partitions {
@@ -227,6 +228,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 
 		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
 		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
+		DPrintf("already tell client to stop")
 
 		if partitions {
 			// log.Printf("wait for partitioner\n")

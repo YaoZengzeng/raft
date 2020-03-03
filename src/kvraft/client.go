@@ -25,9 +25,10 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	DPrintf("number of server is %v", len(servers))
 	// You'll have to add code here.
 	ck.id = nrand()
+	ck.requestID = 1
+
 	return ck
 }
 
@@ -46,24 +47,23 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := &GetArgs{
-		Key:       key,
-		ClerkID:   ck.id,
-		RequestID: ck.requestID,
+		Key:     key,
+		ClerkID: ck.id,
 	}
-	ck.requestID = ck.requestID + 1
 
 	ck.mu.Lock()
 	i := ck.leader
 	ck.mu.Unlock()
 	for {
+		DPrintf("Clerk %d Get to server %d", ck.id, i)
 		reply := &GetReply{}
 		ok := ck.servers[i].Call("KVServer.Get", args, reply)
-		if !ok {
-			DPrintf("clerk %d timeout for server %d", ck.id, i)
-			// Keep request same instance.
-			continue
-		} else if reply.Err != "" {
-			// DPrintf("clerk %d Get reply error is %v", ck.id, reply.Err)
+		if !ok || reply.Err != "" {
+			if !ok {
+				DPrintf("Clerk %d PutAppend timeout", ck.id)
+			} else {
+				DPrintf("Clerk %d PutAppend failed: %v", ck.id, reply.Err)
+			}
 			i = (i + 1) % len(ck.servers)
 			continue
 		}
@@ -103,14 +103,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	i := ck.leader
 	ck.mu.Unlock()
 	for {
+		DPrintf("Clerk %d PutAppend to server %d, requestID is %v", ck.id, i, ck.requestID-1)
 		reply := &PutAppendReply{}
 		ok := ck.servers[i].Call("KVServer.PutAppend", args, reply)
-		if !ok {
-			DPrintf("clerk %d timeout for server %d", ck.id, i)
-			// Keep request same instance.
-			continue
-		} else if reply.Err != "" {
-			// DPrintf("clerk %d %v reply error is %v", ck.id, op, reply.Err)
+		if !ok || reply.Err != "" {
+			if !ok {
+				DPrintf("Clerk %d PutAppend timeout", ck.id)
+			} else {
+				DPrintf("Clerk %d PutAppend failed: %v", ck.id, reply.Err)
+			}
 			i = (i + 1) % len(ck.servers)
 			continue
 		}
