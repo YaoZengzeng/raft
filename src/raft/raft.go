@@ -132,12 +132,11 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastApplied)
+	// e.Encode(rf.lastApplied)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	DPrintf("persist of instance %d, commitIndex is %d, lastApplied is %d, len(log) is %d", rf.me, rf.commitIndex, rf.lastApplied, len(rf.log))
 }
 
 //
@@ -152,21 +151,17 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	var (
-		currentTerm, commitIndex, votedFor, lastApplied int
-		log                                             []LogEntry
+		currentTerm, votedFor, commitIndex int
+		log                                []LogEntry
 	)
-	if d.Decode(&currentTerm) != nil || d.Decode(&commitIndex) != nil || d.Decode(&lastApplied) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+	if d.Decode(&currentTerm) != nil || d.Decode(&commitIndex) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
 		DPrintf("read persist failed")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.commitIndex = commitIndex
-		rf.lastApplied = lastApplied
 		rf.votedFor = votedFor
 		rf.log = log
 	}
-
-	// DPrintf("read persist of instance %d: %v", rf.me, data)
-	DPrintf("instance %d restart, commitIndex is %d, lastApplied is %d, len(log) is %d", rf.me, rf.commitIndex, rf.lastApplied, len(rf.log))
 }
 
 type AppendEntriesArgs struct {
