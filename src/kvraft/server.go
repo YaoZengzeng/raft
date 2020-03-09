@@ -4,6 +4,8 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
+	"fmt"
 	"log"
 	"reflect"
 	"sync"
@@ -11,7 +13,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -56,8 +58,55 @@ type KVServer struct {
 	storage map[string]string // key/value database.
 	notify  map[int]*Handler
 
+	lastIndex int
+	// lastTerm int
+
 	// ClerkID to RequestID
 	records map[int64]int64
+}
+
+// Log compaction.
+func (kv *KVServer) snapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(kv.storage); err != nil {
+		panic(fmt.Sprintf("encode storage of snapshot failed: %v", err))
+	}
+	if err := e.Encode(kv.lastIndex); err != nil {
+		panic(fmt.Sprintf("enocode lastindex of snapshot failed: %v", err))
+	}
+	data := w.Bytes()
+	DPrintf("snapshot is %v", data)
+	// e.Encode(kv.lastTerm)
+	return data
+}
+
+// Restore the snapshot.
+func (kv *KVServer) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		DPrintf("the persist data of instance %d is empty, maybe start first time?", kv.me)
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var (
+		lastIndex int //, lastTerm int
+		storage   map[string]string
+	)
+
+	if err := d.Decode(&storage); err != nil {
+		panic(fmt.Sprintf("parse storage of snapshot failed: %v", err))
+	}
+
+	if err := d.Decode(&lastIndex); err != nil {
+		panic(fmt.Sprintf("pase lastindex of snapshot failed: %v", err))
+	}
+
+	kv.storage = storage
+	kv.lastIndex = lastIndex
+	// kv.lastTerm = lastTerm
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -214,6 +263,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			msg := <-kv.applyCh
 			DPrintf("Server %d get a message %v from applyCh", kv.me, msg)
+
+			if !msg.CommandValid {
+				// It is a snapshot message.
+				kv.readSnapshot(msg.Snapshot)
+
+				kv.mu.Lock()
+				for index, handler := range kv.notify {
+					if index <= kv.lastIndex {
+						handler.ch <- &Result{
+							Err: "command not committed",
+						}
+					}
+				}
+				kv.mu.Unlock()
+				continue
+			}
+
 			op, ok := msg.Command.(Op)
 			if !ok {
 				panic("assert command failed")
@@ -245,6 +311,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			default:
 				panic("invalid command op")
 
+			}
+
+			kv.lastIndex = msg.CommandIndex
+
+			if persister.RaftStateSize() >= maxraftstate {
+				// Make snapshot.
+				DPrintf("instance %d make a snapshot", kv.me)
+				kv.rf.PersistWithSnapshot(kv.snapshot(), kv.lastIndex)
 			}
 
 			kv.mu.Lock()

@@ -43,6 +43,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Snapshot     []byte
 }
 
 type Role string
@@ -90,6 +91,10 @@ type Raft struct {
 	// Index of highest log entry applied to state machine(initialized to 0, increases monotonically).
 	lastApplied int
 
+	// The snapshot replaces all entries up through and including this compactIndex.
+	compactIndex int
+	compactTerm  int
+
 	// Volatile states on leaders.
 	// For each server, index of the next log entry to send to that server.
 	// Initialized to leader last log index + 1.
@@ -132,11 +137,38 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.commitIndex)
+	e.Encode(rf.compactIndex)
+	e.Encode(rf.compactTerm)
 	// e.Encode(rf.lastApplied)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) PersistWithSnapshot(snapshot []byte, lastIncludedIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	ci := rf.compactIndex
+	rf.compactTerm = rf.log[lastIncludedIndex-ci-1].Term
+	rf.compactIndex = lastIncludedIndex
+	rf.log = rf.log[lastIncludedIndex-ci:]
+
+	rf.persistWithSnapshot(snapshot)
+}
+
+func (rf *Raft) persistWithSnapshot(snapshot []byte) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.compactIndex)
+	e.Encode(rf.compactTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 //
@@ -151,14 +183,16 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	var (
-		currentTerm, votedFor, commitIndex int
-		log                                []LogEntry
+		currentTerm, votedFor, commitIndex, compactIndex, compactTerm int
+		log                                                           []LogEntry
 	)
-	if d.Decode(&currentTerm) != nil || d.Decode(&commitIndex) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
-		DPrintf("read persist failed")
+	if d.Decode(&currentTerm) != nil || d.Decode(&commitIndex) != nil || d.Decode(&compactIndex) != nil || d.Decode(&compactTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		panic("read persist failed")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.commitIndex = commitIndex
+		rf.compactIndex = compactIndex
+		rf.compactTerm = compactTerm
 		rf.votedFor = votedFor
 		rf.log = log
 	}
@@ -201,7 +235,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 1. The AppendEntries is out of date.
 		reply.Success = false
 		reply.Term = rf.currentTerm
-	} else if args.PrevLogIndex > len(rf.log) || (args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+	} else if args.PrevLogIndex > len(rf.log)+rf.compactIndex || (args.PrevLogIndex > 0 && args.PrevLogIndex != rf.compactIndex && rf.log[args.PrevLogIndex-rf.compactIndex-1].Term != args.PrevLogTerm) {
 		// The leader is valid.
 		// 2. The PrevLogIndex is longer than Log.
 		// 3. Log doesn't contain an entry at PrevLogIndex
@@ -219,15 +253,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		var (
-			conflictTerm   int
-			firstTermIndex int
+			conflictTerm, firstTermIndex int
 		)
 
-		if len(rf.log) == 0 {
+		if len(rf.log)+rf.compactIndex == 0 {
 			conflictTerm, firstTermIndex = 0, 0
-		} else if args.PrevLogIndex > len(rf.log) {
+		} else if args.PrevLogIndex > len(rf.log)+rf.compactIndex {
 			conflictTerm = rf.log[len(rf.log)-1].Term
-			firstTermIndex = len(rf.log)
+			firstTermIndex = len(rf.log) + rf.compactIndex
+
 			for i := len(rf.log) - 1; i >= 0; i-- {
 				if rf.log[i].Term != conflictTerm {
 					break
@@ -235,9 +269,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				firstTermIndex = firstTermIndex - 1
 			}
 		} else {
-			conflictTerm = rf.log[args.PrevLogIndex-1].Term
+			conflictTerm = rf.log[args.PrevLogIndex-rf.compactIndex-1].Term
 			firstTermIndex = args.PrevLogIndex
-			for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			for i := args.PrevLogIndex - rf.compactIndex - 1; i >= 0; i-- {
 				if rf.log[i].Term != conflictTerm {
 					break
 				}
@@ -265,16 +299,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if len(args.Entries) == 0 {
 			// Heartbeat.
-			if args.LeaderCommit > len(rf.log) {
+			if args.LeaderCommit > len(rf.log)+rf.compactIndex {
 				// commitIndex = min(leaderCommit, index of last new entry).
-				rf.commitIndex = len(rf.log)
+				rf.commitIndex = len(rf.log) + rf.compactIndex
 			}
 
 			if oldCommitIndex != rf.commitIndex {
 				rf.persist()
 			}
 		} else {
-			rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+			rf.log = append(rf.log[:args.PrevLogIndex-rf.compactIndex], args.Entries...)
 			rf.persist()
 		}
 
@@ -285,6 +319,62 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+type InstallSnapshotArgs struct {
+	// Leader's term.
+	Term int
+	// Leader's ID.
+	LeaderID int
+	// The snapshot replaces all entries up through and including
+	// this index.
+	LastIncludedIndex int
+	// Term of LastIncludedIndex
+	LastIncludedTerm int
+	// Raw bytes of snapshot.
+	Data []byte
+}
+
+type InstallSnapshotReply struct {
+	// currentTerm, for leader to update it self.
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term || rf.compactIndex >= args.LastIncludedIndex {
+		// 1. The InstallSnapshot has been out fo date.
+		return
+	} else {
+		rf.compactIndex = args.LastIncludedIndex
+		rf.compactTerm = args.LastIncludedTerm
+		go func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.lastApplied >= rf.compactIndex {
+				return
+			}
+
+			rf.applyCh <- ApplyMsg{
+				CommandValid: false,
+				Snapshot:     args.Data,
+			}
+
+			rf.lastApplied = args.LastIncludedIndex
+			if rf.commitIndex < args.LastIncludedIndex {
+				rf.commitIndex = args.LastIncludedIndex
+			}
+		}()
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -413,9 +503,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
-	rf.matchIndex[rf.me] = len(rf.log)
+	rf.matchIndex[rf.me] = len(rf.log) + rf.compactIndex
 
-	return len(rf.log), rf.currentTerm, true
+	return len(rf.log) + rf.compactIndex, rf.currentTerm, true
 }
 
 //
@@ -486,7 +576,7 @@ func (rf *Raft) runAsCandidate(args *RequestVoteArgs) {
 									// Initialize the volatile state of Leader.
 									for i := 0; i < len(rf.peers); i++ {
 										if i != rf.me {
-											rf.nextIndex[i] = len(rf.log) + 1
+											rf.nextIndex[i] = len(rf.log) + rf.compactIndex + 1
 											rf.matchIndex[i] = 0
 										} else {
 											// Initialize the matchIndex of leader to len(rf.log).
@@ -600,7 +690,7 @@ func (rf *Raft) runAsLeader(currentTerm int) {
 						return
 					}
 					// TODO: maybe change to condition variable.
-					if len(rf.log) == 0 || (rf.matchIndex[i] != 0 && rf.nextIndex[i] == len(rf.log)+1) {
+					if len(rf.log)+rf.compactIndex == 0 || (rf.matchIndex[i] != 0 && rf.nextIndex[i] == len(rf.log)+rf.compactIndex+1) {
 						// 1. Instance don't have log, so don't need to append.
 						// 2. Log has been appended.
 						rf.mu.Unlock()
@@ -608,60 +698,104 @@ func (rf *Raft) runAsLeader(currentTerm int) {
 						continue
 					}
 
-					prevLogIndex, prevLogTerm := rf.nextIndex[i]-1, 0
-					if prevLogIndex > 0 {
-						prevLogTerm = rf.log[prevLogIndex-1].Term
-					}
-					entries := rf.log[prevLogIndex:]
-					args := &AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderID:     rf.me,
-						LeaderCommit: rf.commitIndex,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      entries,
-					}
-					rf.mu.Unlock()
-
-					reply := &AppendEntriesReply{}
-					if ok := rf.sendAppendEntries(i, args, reply); ok {
-						rf.mu.Lock()
-						if rf.currentTerm != args.Term {
-							// Another term, just return.
-							rf.mu.Unlock()
-							return
+					if rf.compactIndex != 0 && rf.nextIndex[i] <= rf.compactIndex {
+						DPrintf("instance %d send snapshot to %d", rf.me, i)
+						args := &InstallSnapshotArgs{
+							Term:              rf.currentTerm,
+							LeaderID:          rf.me,
+							LastIncludedIndex: rf.compactIndex,
+							LastIncludedTerm:  rf.compactTerm,
+							Data:              rf.persister.ReadSnapshot(),
 						}
-						if reply.Success {
-							rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
-							rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-							DPrintf("instance %d AppendEntries to %d succeeded, matchIndex[i] is %d", rf.me, i, rf.matchIndex[i])
-						} else {
+						rf.mu.Unlock()
+
+						reply := &InstallSnapshotReply{}
+						if ok := rf.sendInstallSnapshot(i, args, reply); ok {
+							rf.mu.Lock()
+							if rf.currentTerm != args.Term {
+								// Another term, just return.
+								rf.mu.Unlock()
+								return
+							}
 							if reply.Term > rf.currentTerm {
+								DPrintf("instance %d reply term of snapshot is %d", rf.me, reply.Term)
 								// Convert back to Follower.
-								// DPrintf("instance %d leader -> follower, received RequestVoteReply, currentTerm: %d, reply.Term: %d", rf.me, rf.currentTerm, reply.Term)
 								rf.currentTerm = reply.Term
 								rf.role = Follower
-								// This instance will never vote for others in this term.
 								rf.votedFor = rf.me
 								cancel()
 							} else {
-								if reply.FirstTermIndex == 0 {
-									// The log of follower is zero.So just set nextIndex to 1.
-									rf.nextIndex[i] = 1
-								} else if rf.log[reply.FirstTermIndex-1].Term == reply.ConflictTerm {
-									// Leader has log entries with followers conflicting term.
-									// Move nextIndex back to leader's last entry for the conflicting term.
-									index := reply.FirstTermIndex
-									for ; rf.log[index-1].Term == reply.Term; index++ {
-									}
-									rf.nextIndex[i] = index
-								} else {
-									// Else, move nextIndex back to follower's first index for the conflicting term.
-									rf.nextIndex[i] = reply.FirstTermIndex
-								}
+								DPrintf("instance %d successfully send snapshot to %d", rf.me, reply.Term)
+								rf.nextIndex[i] = args.LastIncludedIndex + 1
+								rf.matchIndex[i] = args.LastIncludedIndex
+							}
+							rf.mu.Unlock()
+						} else {
+							DPrintf("instance %d send snapshot to %d, but return false", rf.me, i)
+						}
+					} else {
+						prevLogIndex, prevLogTerm := rf.nextIndex[i]-1, 0
+						if prevLogIndex > 0 {
+							if prevLogIndex == rf.compactIndex {
+								prevLogTerm = rf.compactTerm
+							} else {
+								prevLogTerm = rf.log[prevLogIndex-rf.compactIndex-1].Term
 							}
 						}
+						entries := rf.log[prevLogIndex-rf.compactIndex:]
+						args := &AppendEntriesArgs{
+							Term:         rf.currentTerm,
+							LeaderID:     rf.me,
+							LeaderCommit: rf.commitIndex,
+							PrevLogIndex: prevLogIndex,
+							PrevLogTerm:  prevLogTerm,
+							Entries:      entries,
+						}
 						rf.mu.Unlock()
+
+						reply := &AppendEntriesReply{}
+						if ok := rf.sendAppendEntries(i, args, reply); ok {
+							rf.mu.Lock()
+							if rf.currentTerm != args.Term {
+								// Another term, just return.
+								rf.mu.Unlock()
+								return
+							}
+							if reply.Success {
+								rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
+								rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+								DPrintf("instance %d AppendEntries to %d succeeded, matchIndex[i] is %d", rf.me, i, rf.matchIndex[i])
+							} else {
+								if reply.Term > rf.currentTerm {
+									// Convert back to Follower.
+									// DPrintf("instance %d leader -> follower, received RequestVoteReply, currentTerm: %d, reply.Term: %d", rf.me, rf.currentTerm, reply.Term)
+									rf.currentTerm = reply.Term
+									rf.role = Follower
+									// This instance will never vote for others in this term.
+									rf.votedFor = rf.me
+									cancel()
+								} else {
+									if reply.FirstTermIndex == 0 {
+										// The log of follower is zero.So just set nextIndex to 1.
+										rf.nextIndex[i] = 1
+									} else if reply.FirstTermIndex <= rf.compactIndex {
+										// The FirstTermIndex is in snapshot, send snapshot to follower directly.
+										rf.nextIndex[i] = reply.FirstTermIndex
+									} else if rf.log[reply.FirstTermIndex-1].Term == reply.ConflictTerm {
+										// Leader has log entries with followers conflicting term.
+										// Move nextIndex back to leader's last entry for the conflicting term.
+										index := reply.FirstTermIndex
+										for ; rf.log[index-1].Term == reply.Term; index++ {
+										}
+										rf.nextIndex[i] = index
+									} else {
+										// Else, move nextIndex back to follower's first index for the conflicting term.
+										rf.nextIndex[i] = reply.FirstTermIndex
+									}
+								}
+							}
+							rf.mu.Unlock()
+						}
 					}
 
 					select {
@@ -693,7 +827,7 @@ func (rf *Raft) runAsLeader(currentTerm int) {
 			}
 			sort.Ints(s)
 
-			if s[len(s)/2] > rf.commitIndex && rf.log[s[len(s)/2]-1].Term == rf.currentTerm {
+			if s[len(s)/2] > rf.commitIndex && rf.log[s[len(s)/2]-rf.compactIndex-1].Term == rf.currentTerm {
 				DPrintf("CommandIndex of leader %d has been updated to %d", rf.me, s[len(s)/2])
 				rf.commitIndex = s[len(s)/2]
 				rf.persist()
@@ -779,13 +913,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Wait for commitIndex to be updated.
 	go func() {
+		rf.mu.Lock()
+		if rf.compactIndex != 0 {
+			applyCh <- ApplyMsg{
+				CommandValid: false,
+				Snapshot:     persister.ReadSnapshot(),
+			}
+			rf.lastApplied = rf.compactIndex
+		}
+		rf.mu.Unlock()
+
 		for {
 			time.Sleep(10 * time.Millisecond)
 
 			var entries []LogEntry
 			rf.mu.Lock()
 			if rf.commitIndex > rf.lastApplied {
-				entries = rf.log[rf.lastApplied:rf.commitIndex]
+				entries = rf.log[rf.lastApplied-rf.compactIndex : rf.commitIndex-rf.compactIndex]
 			}
 			record := rf.lastApplied
 			commitIndex := rf.commitIndex
