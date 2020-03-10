@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -72,11 +72,13 @@ func (kv *KVServer) snapshot() []byte {
 	if err := e.Encode(kv.storage); err != nil {
 		panic(fmt.Sprintf("encode storage of snapshot failed: %v", err))
 	}
+	if err := e.Encode(kv.records); err != nil {
+		panic(fmt.Sprintf("encode records of snapshot failed: %v", err))
+	}
 	if err := e.Encode(kv.lastIndex); err != nil {
 		panic(fmt.Sprintf("enocode lastindex of snapshot failed: %v", err))
 	}
 	data := w.Bytes()
-	DPrintf("snapshot is %v", data)
 	// e.Encode(kv.lastTerm)
 	return data
 }
@@ -94,10 +96,15 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	var (
 		lastIndex int //, lastTerm int
 		storage   map[string]string
+		records   map[int64]int64
 	)
 
 	if err := d.Decode(&storage); err != nil {
 		panic(fmt.Sprintf("parse storage of snapshot failed: %v", err))
+	}
+
+	if err := d.Decode(&records); err != nil {
+		panic(fmt.Sprintf("parse records of snapshot failed: %v", err))
 	}
 
 	if err := d.Decode(&lastIndex); err != nil {
@@ -105,6 +112,7 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	}
 
 	kv.storage = storage
+	kv.records = records
 	kv.lastIndex = lastIndex
 	// kv.lastTerm = lastTerm
 }
@@ -283,6 +291,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			op, ok := msg.Command.(Op)
 			if !ok {
 				panic("assert command failed")
+			}
+
+			if msg.CommandIndex <= kv.lastIndex {
+				// Skip already snapshoted command.
+				continue
 			}
 
 			var value string
