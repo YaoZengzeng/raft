@@ -149,11 +149,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			if !isLeader || term != current {
 				// This request may never be committed, just return.
 				reply.Err = ErrWrongLeader
-				go func() {
+				go func(index int) {
 					<-handler.ch
-				}()
+					kv.mu.Lock()
+					delete(kv.notify, index)
+					kv.mu.Unlock()
+				}(index)
 				return
 			}
+			DPrintf("%d is leader, current is %d", kv.me, term)
 		}
 	}
 
@@ -208,6 +212,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				}()
 				return
 			}
+			DPrintf("%d is leader, current is %d", kv.me, term)
 		}
 	}
 
@@ -279,9 +284,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				kv.mu.Lock()
 				for index, handler := range kv.notify {
 					if index <= kv.lastIndex {
-						handler.ch <- &Result{
-							Err: "command not committed",
-						}
+						go func() {
+							handler.ch <- &Result{
+								Err: "command not committed",
+							}
+						}()
 					}
 				}
 				kv.mu.Unlock()
@@ -327,11 +334,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			}
 
 			kv.lastIndex = msg.CommandIndex
+			DPrintf("lastindex of server %d is %d", kv.me, kv.lastIndex)
 
-			if persister.RaftStateSize() >= maxraftstate {
+			if maxraftstate > 0 && persister.RaftStateSize() >= maxraftstate {
 				// Make snapshot.
 				DPrintf("instance %d make a snapshot", kv.me)
-				kv.rf.PersistWithSnapshot(kv.snapshot(), kv.lastIndex)
+				data := kv.snapshot()
+				go kv.rf.PersistWithSnapshot(data, kv.lastIndex)
 			}
 
 			kv.mu.Lock()

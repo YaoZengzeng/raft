@@ -116,6 +116,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			continue
 		}
 
+		DPrintf("Clerk %d PutAppend succeeded", ck.id)
+
 		// Remember leader.
 		ck.mu.Lock()
 		ck.leader = i
